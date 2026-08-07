@@ -73,12 +73,9 @@ DEFAULT_DATA = {
     "qa": {},              # {"سوال": "جواب"}
     "muted": False,        # سکوت = خاموش بودن منشی و پاسخ خودکار
     "antigroup": {},       # {"<group_id>": {"links": bool, "flood": bool}}
-    "self_reminder": {     # یادآوری تایم‌دار فقط به خودِ Saved Messages (هیچ ارسالی به گروه‌ها انجام نمی‌شود)
-        "enabled": False,
-        "interval_minutes": 0,
-        "message": "⏰ یادآوری",
-    },
+    "scheduled": [],       # [{"id":1,"minutes":2,"command":"پینگ","enabled":True,"last_run":0}]
 }
+
 
 
 def load_data():
@@ -109,43 +106,6 @@ flood_tracker = {}
 LINK_REGEX = re.compile(r"(https?://|t\.me/|telegram\.me/|@[\w\d_]{4,})", re.IGNORECASE)
 
 # ---------------------------------------------------------------------------
-# یادآوری تایم‌دار به سیو مسیج (Saved Messages)
-# توجه: این قابلیت فقط برای خودِ شما پیام می‌فرستد، نه به هیچ گروهی.
-# هیچ ارسال خودکار/زمان‌بندی‌شده‌ای به گروه‌ها در این پروژه وجود ندارد.
-# ---------------------------------------------------------------------------
-
-_reminder_task_holder = {"task": None}
-
-
-async def _self_reminder_loop(client: TelegramClient, chat_id: int):
-    try:
-        while True:
-            interval = data["self_reminder"].get("interval_minutes", 0)
-            if not data["self_reminder"].get("enabled") or interval <= 0:
-                break
-            await asyncio.sleep(max(interval, 1) * 60)
-            # وضعیت را دوباره چک می‌کنیم چون ممکن است در حین انتظار خاموش شده باشد
-            if not data["self_reminder"].get("enabled"):
-                break
-            msg = data["self_reminder"].get("message") or "⏰ یادآوری"
-            try:
-                await client.send_message(chat_id, msg)
-            except Exception:
-                log.exception("خطا در ارسال یادآوری به سیو مسیج")
-    except asyncio.CancelledError:
-        pass
-
-
-def _restart_self_reminder(client: TelegramClient, chat_id: int):
-    old = _reminder_task_holder.get("task")
-    if old is not None and not old.done():
-        old.cancel()
-    if data["self_reminder"].get("enabled") and data["self_reminder"].get("interval_minutes", 0) > 0:
-        _reminder_task_holder["task"] = asyncio.create_task(_self_reminder_loop(client, chat_id))
-    else:
-        _reminder_task_holder["task"] = None
-
-# ---------------------------------------------------------------------------
 # کلاینت ربات ورود (bot_client) - با BOT_TOKEN از BotFather
 # ---------------------------------------------------------------------------
 
@@ -157,6 +117,52 @@ user_client_lock = asyncio.Lock()
 
 # وضعیت مکالمه‌ی ورود برای هر کاربر: {user_id: {"step":..., "phone":..., "phone_code_hash":..., "temp_client":...}}
 login_state = {}
+
+# تسک بک‌گراند زمان‌بند دستورات
+scheduler_task: asyncio.Task | None = None
+
+
+def next_schedule_id() -> int:
+    ids = [j.get("id", 0) for j in data["scheduled"]]
+    return (max(ids) + 1) if ids else 1
+
+
+def find_schedule_index(idx_text: str):
+    try:
+        idx = int(idx_text)
+        if 1 <= idx <= len(data["scheduled"]):
+            return idx - 1
+    except ValueError:
+        pass
+    return None
+
+
+async def scheduler_loop(client: TelegramClient):
+    """هر ۱۵ ثانیه چک می‌کند و دستوراتی که موعدشان رسیده را به‌صورت خودکار
+    در پیام‌های ذخیره‌شده اجرا می‌کند (دقیقاً مثل اینکه خودتان تایپ کرده باشید)."""
+    while True:
+        try:
+            await asyncio.sleep(15)
+            me = await client.get_me()
+            now = time.time()
+            changed = False
+            for job in list(data.get("scheduled", [])):
+                if not job.get("enabled", True):
+                    continue
+                interval = max(1, int(job.get("minutes", 1))) * 60
+                if now - job.get("last_run", 0) >= interval:
+                    job["last_run"] = now
+                    changed = True
+                    try:
+                        await client.send_message(me.id, job["command"])
+                    except Exception:
+                        log.exception("خطا در اجرای خودکار دستور زمان‌بندی‌شده: %s", job.get("command"))
+            if changed:
+                save_data(data)
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            log.exception("خطا در حلقه‌ی زمان‌بند")
 
 
 def is_owner(uid: int) -> bool:
@@ -305,19 +311,20 @@ async def finish_login(event, uid, temp_client: TelegramClient):
 # ---------------------------------------------------------------------------
 
 async def start_user_client(session_str: str):
-    global user_client
+    global user_client, scheduler_task
     async with user_client_lock:
         if user_client is not None and user_client.is_connected():
             await user_client.disconnect()
+        if scheduler_task is not None and not scheduler_task.done():
+            scheduler_task.cancel()
         user_client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
         await user_client.connect()
         if not await user_client.is_user_authorized():
             log.error("سشن معتبر نیست؛ نیاز به ورود مجدد دارید (/login در ربات ورود)")
             return
         register_user_handlers(user_client)
-        me = await user_client.get_me()
-        _restart_self_reminder(user_client, me.id)
-        log.info("کلاینت سلف با موفقیت متصل شد.")
+        scheduler_task = asyncio.create_task(scheduler_loop(user_client))
+        log.info("کلاینت سلف با موفقیت متصل شد. زمان‌بند دستورات فعال شد.")
 
 
 # ---------------------------------------------------------------------------
@@ -333,12 +340,6 @@ HELP_MAIN = """📖 راهنمای کامل ربات
 راهنما <بخش> — توضیح کامل یک بخش (مثال: راهنما بنر)
 پینگ — تست سرعت اتصال
 آیدی — نمایش آیدی عددی خودتان
-
-🔹 یادآوری تایم‌دار (فقط در سیو مسیج خودتان، هیچ ارسالی به گروه‌ها نیست)
-تنظیم دقیقه ارسال به سیو مسیج <عدد> — مثال: تنظیم دقیقه ارسال به سیو مسیج 10
-متن یادآوری سیو مسیج <متن> — مثال: متن یادآوری سیو مسیج پینگ
-توقف یادآوری سیو مسیج
-وضعیت یادآوری سیو مسیج
 
 🔹 گروه‌ها
 لیست گروه‌ها
@@ -367,6 +368,13 @@ HELP_MAIN = """📖 راهنمای کامل ربات
 آنتی گروه روشن <شماره گروه>
 آنتی گروه خاموش <شماره گروه>
 آنتی گروه وضعیت <شماره گروه>
+
+🔹 زمان‌بندی دستورات (اجرای خودکار در بازه‌ی زمانی)
+زمانبندی افزودن <دقیقه> | <دستور>
+لیست زمانبندی
+زمانبندی روشن <شماره>
+زمانبندی خاموش <شماره>
+حذف زمانبندی <شماره>
 
 ⚠️ توجه: این ربات هیچ ارسال خودکار یا زمان‌بندی‌شده‌ی تبلیغاتی به گروه‌ها انجام نمی‌دهد؛ چون این کار طبق قوانین تلگرام اسپم محسوب می‌شود و می‌تواند اکانت شما را در خطر بیندازد. ارسال بنر همیشه با دستور دستی خودتان انجام می‌شود."""
 
@@ -404,15 +412,6 @@ HELP_SECTIONS = {
         "افزودن ادمین <آیدی> / حذف ادمین <آیدی> / لیست ادمین‌ها — مدیریت افرادی که اجازه‌ی "
         "تغییر تنظیمات ربات از طریق ربات ورود (پیوی) را دارند."
     ),
-    "یادآوری": (
-        "📌 راهنمای یادآوری تایم‌دار سیو مسیج\n\n"
-        "این قابلیت فقط یک پیام هر N دقیقه به خودِ «پیام‌های ذخیره‌شده» (Saved Messages) شما می‌فرستد. "
-        "هیچ پیامی به هیچ گروهی ارسال نمی‌شود؛ صرفاً یک یادآوری شخصی است.\n\n"
-        "تنظیم دقیقه ارسال به سیو مسیج <عدد> — مثلا: تنظیم دقیقه ارسال به سیو مسیج 10\n"
-        "متن یادآوری سیو مسیج <متن دلخواه> — تغییر متن پیام یادآوری (پیش‌فرض: ⏰ یادآوری)\n"
-        "توقف یادآوری سیو مسیج — خاموش کردن\n"
-        "وضعیت یادآوری سیو مسیج — نمایش وضعیت فعلی"
-    ),
     "ادیت": HELP_MAIN,
     "کل": HELP_MAIN,
     "آنتی": (
@@ -422,6 +421,21 @@ HELP_SECTIONS = {
         "آنتی گروه خاموش <شماره گروه>\n"
         "آنتی گروه وضعیت <شماره گروه>\n\n"
         "توجه: این قابلیت فقط زمانی کار می‌کند که اکانت شما در آن گروه دسترسی حذف پیام داشته باشد."
+    ),
+    "زمانبندی": (
+        "📌 راهنمای زمان‌بندی دستورات\n\n"
+        "با این بخش می‌توانید هر دستوری از همین ربات (مثلاً پینگ، آیدی، لیست گروه‌ها و ...) را "
+        "طوری تنظیم کنید که خودش هر چند دقیقه یک‌بار به‌طور خودکار در پیام‌های ذخیره‌شده اجرا شود؛ "
+        "دقیقاً مثل اینکه خودتان تایپش کرده باشید.\n\n"
+        "زمانبندی افزودن <دقیقه> | <دستور> — مثال:\n"
+        "   زمانبندی افزودن 2 | پینگ\n"
+        "   (یعنی دستور «پینگ» هر ۲ دقیقه یک‌بار خودکار اجرا شود)\n\n"
+        "لیست زمانبندی — نمایش همه‌ی موارد زمان‌بندی‌شده با شماره\n"
+        "زمانبندی روشن <شماره> / زمانبندی خاموش <شماره> — فعال یا موقتاً متوقف کردن یک مورد\n"
+        "حذف زمانبندی <شماره> — حذف کامل یک مورد\n\n"
+        "⚠️ به دلایل امنیتی و برای جلوگیری از بن شدن اکانت، دستور «ارسال بنر» (ارسال دسته‌جمعی "
+        "به گروه‌ها) قابل زمان‌بندی خودکار نیست و همیشه باید دستی اجرا شود؛ چون ارسال تکراری و "
+        "خودکار پیام به گروه‌های زیاد دقیقاً همان کاری‌ست که قوانین ضداسپم تلگرام آن را جریمه می‌کند."
     ),
 }
 
@@ -473,52 +487,6 @@ def register_user_handlers(client: TelegramClient):
         # ---------- آیدی ----------
         if text == "آیدی":
             await event.edit(f"🆔 آیدی عددی شما: `{me.id}`", parse_mode="markdown")
-            return
-
-        # ---------- یادآوری تایم‌دار در سیو مسیج (فقط به خودتان، نه به گروه‌ها) ----------
-        if text.startswith("تنظیم دقیقه ارسال به سیو مسیج"):
-            arg = text.replace("تنظیم دقیقه ارسال به سیو مسیج", "", 1).strip()
-            if not arg.isdigit() or int(arg) <= 0:
-                await event.edit("مثال: تنظیم دقیقه ارسال به سیو مسیج 10")
-                return
-            minutes = int(arg)
-            data["self_reminder"]["interval_minutes"] = minutes
-            data["self_reminder"]["enabled"] = True
-            save_data(data)
-            _restart_self_reminder(client, me.id)
-            await event.edit(
-                f"✅ یادآوری هر {minutes} دقیقه فقط در سیو مسیج خودتان فعال شد.\n"
-                f"متن فعلی: «{data['self_reminder']['message']}»\n"
-                "برای تغییر متن: متن یادآوری سیو مسیج <متن دلخواه>\n"
-                "برای توقف: توقف یادآوری سیو مسیج"
-            )
-            return
-
-        if text.startswith("متن یادآوری سیو مسیج"):
-            msg = text.replace("متن یادآوری سیو مسیج", "", 1).strip()
-            if not msg:
-                await event.edit("مثال: متن یادآوری سیو مسیج پینگ")
-                return
-            data["self_reminder"]["message"] = msg
-            save_data(data)
-            await event.edit(f"✅ متن یادآوری تنظیم شد: «{msg}»")
-            return
-
-        if text == "توقف یادآوری سیو مسیج":
-            data["self_reminder"]["enabled"] = False
-            save_data(data)
-            _restart_self_reminder(client, me.id)
-            await event.edit("🔴 یادآوری سیو مسیج متوقف شد.")
-            return
-
-        if text == "وضعیت یادآوری سیو مسیج":
-            r = data["self_reminder"]
-            status = "فعال ✅" if r.get("enabled") else "غیرفعال 🔴"
-            await event.edit(
-                f"وضعیت یادآوری سیو مسیج: {status}\n"
-                f"فاصله: هر {r.get('interval_minutes', 0)} دقیقه\n"
-                f"متن: «{r.get('message', '')}»"
-            )
             return
 
         # ---------- گروه‌ها ----------
@@ -737,6 +705,75 @@ def register_user_handlers(client: TelegramClient):
             gid = str(data["groups"][idx]["id"])
             state = data["antigroup"].get(gid)
             await event.edit("فعال ✅" if state else "غیرفعال 🔴")
+            return
+
+        # ---------- زمان‌بندی دستورات ----------
+        if text.startswith("زمانبندی افزودن"):
+            rest = text.replace("زمانبندی افزودن", "", 1).strip()
+            if "|" not in rest:
+                await event.edit("فرمت درست: زمانبندی افزودن <دقیقه> | <دستور>\nمثال: زمانبندی افزودن 2 | پینگ")
+                return
+            minutes_text, cmd_text = rest.split("|", 1)
+            minutes_text = minutes_text.strip()
+            cmd_text = cmd_text.strip()
+            if not minutes_text.isdigit() or int(minutes_text) < 1:
+                await event.edit("دقیقه باید یک عدد صحیح و حداقل 1 باشد.")
+                return
+            if not cmd_text:
+                await event.edit("دستور نمی‌تواند خالی باشد.")
+                return
+            
+            job = {
+                "id": next_schedule_id(),
+                "minutes": int(minutes_text),
+                "command": cmd_text,
+                "enabled": True,
+                "last_run": 0,
+            }
+            data["scheduled"].append(job)
+            save_data(data)
+            await event.edit(f"✅ زمان‌بندی ثبت شد: هر {job['minutes']} دقیقه دستور «{job['command']}» اجرا می‌شود.")
+            return
+
+        if text == "لیست زمانبندی":
+            if not data["scheduled"]:
+                await event.edit("هنوز هیچ زمان‌بندی‌ای ثبت نشده. با «زمانبندی افزودن» اضافه کنید.")
+                return
+            lines = ["⏱ لیست زمان‌بندی‌ها:"]
+            for i, j in enumerate(data["scheduled"], 1):
+                status = "فعال ✅" if j.get("enabled", True) else "متوقف 🔴"
+                lines.append(f"{i}. هر {j['minutes']} دقیقه — «{j['command']}» — {status}")
+            await event.edit("\n".join(lines))
+            return
+
+        if text.startswith("زمانبندی روشن"):
+            idx = find_schedule_index(text.replace("زمانبندی روشن", "", 1).strip())
+            if idx is None:
+                await event.edit("شماره زمان‌بندی نامعتبر است. اول «لیست زمانبندی» را بزنید.")
+                return
+            data["scheduled"][idx]["enabled"] = True
+            save_data(data)
+            await event.edit(f"✅ زمان‌بندی «{data['scheduled'][idx]['command']}» فعال شد.")
+            return
+
+        if text.startswith("زمانبندی خاموش"):
+            idx = find_schedule_index(text.replace("زمانبندی خاموش", "", 1).strip())
+            if idx is None:
+                await event.edit("شماره زمان‌بندی نامعتبر است. اول «لیست زمانبندی» را بزنید.")
+                return
+            data["scheduled"][idx]["enabled"] = False
+            save_data(data)
+            await event.edit(f"🔴 زمان‌بندی «{data['scheduled'][idx]['command']}» متوقف شد.")
+            return
+
+        if text.startswith("حذف زمانبندی"):
+            idx = find_schedule_index(text.replace("حذف زمانبندی", "", 1).strip())
+            if idx is None:
+                await event.edit("شماره زمان‌بندی نامعتبر است. اول «لیست زمانبندی» را بزنید.")
+                return
+            removed = data["scheduled"].pop(idx)
+            save_data(data)
+            await event.edit(f"🗑 زمان‌بندی «{removed['command']}» حذف شد.")
             return
 
     # ---------- منشی خودکار در پیوی ----------
