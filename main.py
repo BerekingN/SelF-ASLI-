@@ -450,6 +450,33 @@ def find_group_index(idx_text: str):
     return None
 
 
+async def resolve_group_entity(client: TelegramClient, target):
+    """
+    تلاش قوی‌تر برای پیدا کردن entity یک گروه/چت، چه با یوزرنیم/لینک و چه با آیدی عددی.
+
+    مشکل رایج Telethon: وقتی آیدی عددی خام (مثل -1001234567890) به get_entity داده
+    می‌شود ولی این چت هنوز در کش entity کلاینت (که بر اساس دیالوگ‌ها/پیام‌های قبلی
+    ساخته می‌شود) وجود ندارد، با خطای "Cannot find any entity..." مواجه می‌شوید؛
+    چون برای سوپرگروه/کانال، فقط آیدی کافی نیست و access_hash هم لازم است.
+    این تابع ابتدا نرمال تلاش می‌کند و اگر با آیدی عددی شکست خورد، یک‌بار دیالوگ‌ها
+    را تازه می‌کند (که کش را پر می‌کند) و دوباره امتحان می‌کند.
+    """
+    if isinstance(target, str):
+        target = target.strip()
+        if re.match(r"^-?\d+$", target):
+            target = int(target)
+    try:
+        return await client.get_entity(target)
+    except Exception as first_err:
+        if isinstance(target, int):
+            try:
+                await client.get_dialogs()
+                return await client.get_entity(target)
+            except Exception:
+                pass
+        raise first_err
+
+
 # ---------------------------------------------------------------------------
 # ثبت‌کننده‌ی دستورات سلف (روی user_client)
 # ---------------------------------------------------------------------------
@@ -506,8 +533,7 @@ def register_user_handlers(client: TelegramClient):
                 await event.edit("مثال: افزودن گروه @mygroup یا افزودن گروه -1001234567890")
                 return
             try:
-                entity = await client.get_entity(target)
-                gid = entity.id if not str(entity.id).startswith("-") else entity.id
+                entity = await resolve_group_entity(client, target)
                 full_id = entity.id
                 title = getattr(entity, "title", None) or getattr(entity, "username", str(full_id))
                 if any(g["id"] == full_id for g in data["groups"]):
@@ -517,7 +543,16 @@ def register_user_handlers(client: TelegramClient):
                 save_data(data)
                 await event.edit(f"✅ گروه «{title}» اضافه شد.")
             except Exception as e:
-                await event.edit(f"خطا در پیدا کردن گروه: {e}")
+                await event.edit(
+                    f"❌ خطا در پیدا کردن گروه: {e}\n\n"
+                    "چند نکته برای رفع مشکل:\n"
+                    "• اگر با آیدی عددی امتحان می‌کنید، مطمئن شوید همان آیدی معتبر است "
+                    "(می‌توانید با فوروارد یک پیام از آن گروه به @userinfobot آیدی درست را بگیرید).\n"
+                    "• اگر گروه پابلیک است، یوزرنیمش را با @ امتحان کنید، مثلاً: افزودن گروه @mygroup\n"
+                    "• حتماً باید عضو آن گروه باشید.\n"
+                    "• اگر تازه عضو شده‌اید، یک پیام (حتی یک ایموجی) در همان گروه بفرستید یا "
+                    "چند ثانیه صبر کنید تا Telethon آن را در کش دیالوگ‌هایش ببیند، سپس دوباره امتحان کنید."
+                )
             return
 
         if text.startswith("حذف گروه"):
@@ -572,14 +607,28 @@ def register_user_handlers(client: TelegramClient):
                     return
                 targets = [data["groups"][idx]]
             ok, fail = 0, 0
+            errors = []
             for g in targets:
                 try:
-                    await client.forward_messages(g["id"], b["msg_id"], b["chat_id"])
+                    # به‌جای پاس دادن مستقیم آیدی خام، اول entity واقعی را با کمک
+                    # resolve_group_entity پیدا می‌کنیم (شامل تلاش دوم با تازه‌سازی
+                    # دیالوگ‌ها اگر لازم باشد)، سپس فوروارد را روی همان انجام می‌دهیم.
+                    target_entity = await resolve_group_entity(client, g["id"])
+                    await client.forward_messages(target_entity, b["msg_id"], b["chat_id"])
                     ok += 1
                     await asyncio.sleep(2)  # فاصله‌ی کوتاه برای رعایت محدودیت‌های تلگرام
-                except Exception:
+                except Exception as e:
                     fail += 1
-            await event.edit(f"📤 ارسال دستی انجام شد. موفق: {ok} | ناموفق: {fail}")
+                    errors.append(f"{g.get('title', g['id'])}: {e}")
+                    log.exception("خطا در ارسال بنر به گروه %s", g.get("title", g["id"]))
+            report = f"📤 ارسال انجام شد. موفق: {ok} | ناموفق: {fail}"
+            if errors:
+                # فقط چند خطای اول را نشان می‌دهیم تا پیام خیلی طولانی نشود
+                shown = errors[:5]
+                report += "\n\nجزئیات خطاها:\n" + "\n".join(f"• {err}" for err in shown)
+                if len(errors) > len(shown):
+                    report += f"\n... و {len(errors) - len(shown)} خطای دیگر (لاگ سرور را هم چک کنید)"
+            await event.edit(report)
             return
 
         # ---------- منشی ----------
